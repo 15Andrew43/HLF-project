@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 
 	"github.com/15Andrew43/HLF-project/internal/repository"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
@@ -33,7 +34,7 @@ func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface,
 		log.Printf("err: %v", err.Error())
 		return err
 	}
-	item.Owner = toOwner(mspID, clientID)
+	item.Owner = toOwner(clientID, mspID)
 	item.Type = fmt.Sprint(reflect.TypeOf(*item))
 
 	err = s.repository.Assets().Set(ctx, item)
@@ -47,20 +48,20 @@ func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface,
 
 // ReadAsset returns the asset stored in the world state with given id.
 func (s *SmartContract) ReadAsset(ctx contractapi.TransactionContextInterface, id string) (*model.Asset, error) {
+	mspID, _, err := GetClient(ctx)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return nil, err
+	}
+
 	asset, err := s.repository.Assets().Get(ctx, id)
 	if err != nil {
 		log.Printf("err: %v", err.Error())
 		return nil, err
 	}
 
-	granted, err := s.isAccessGranted(ctx, asset)
-	if err != nil {
-		log.Printf("err: %v", err.Error())
-		return nil, err
-	}
-
-	if !granted {
-		err = errors.New("forbidden")
+	if !s.isSameMSP(asset.Owner, mspID) {
+		err = errors.New("access denied: only participants of the same MSP can read this asset")
 		log.Printf("err: %v", err.Error())
 		return nil, err
 	}
@@ -70,13 +71,25 @@ func (s *SmartContract) ReadAsset(ctx contractapi.TransactionContextInterface, i
 
 // UpdateAsset updates an existing asset in the world state with provided parameters.
 func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface, item *model.Asset) error {
+	mspID, clientID, err := GetClient(ctx)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return err
+	}
+
 	asset, err := s.ReadAsset(ctx, item.ID)
 	if err != nil {
 		log.Printf("err: %v", err.Error())
 		return err
 	}
 
-	err = s.repository.Assets().Set(ctx, asset)
+	if !s.isOwner(asset.Owner, clientID, mspID) {
+		err = errors.New("access denied: only the creator can update their asset")
+		log.Printf("err: %v", err.Error())
+		return err
+	}
+
+	err = s.repository.Assets().Set(ctx, item)
 	if err != nil {
 		log.Printf("err: %v", err.Error())
 		return err
@@ -87,8 +100,20 @@ func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface,
 
 // DeleteAsset deletes a given asset from the world state.
 func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface, id string) error {
-	_, err := s.ReadAsset(ctx, id)
+	mspID, clientID, err := GetClient(ctx)
 	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return err
+	}
+
+	asset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return err
+	}
+
+	if !s.isOwner(asset.Owner, clientID, mspID) {
+		err = errors.New("access denied: only the creator can delete their asset")
 		log.Printf("err: %v", err.Error())
 		return err
 	}
@@ -118,8 +143,20 @@ func (s *SmartContract) AssetExists(ctx contractapi.TransactionContextInterface,
 
 // TransferAsset updates the owner field of asset with given id in world state, and returns the old owner.
 func (s *SmartContract) TransferAsset(ctx contractapi.TransactionContextInterface, id string, newOwner string) (string, error) {
+	mspID, clientID, err := GetClient(ctx)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return "", err
+	}
+
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return "", err
+	}
+
+	if !s.isOwner(asset.Owner, clientID, mspID) {
+		err = errors.New("access denied: only the creator can transfer their asset")
 		log.Printf("err: %v", err.Error())
 		return "", err
 	}
@@ -137,6 +174,12 @@ func (s *SmartContract) TransferAsset(ctx contractapi.TransactionContextInterfac
 }
 
 func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface) ([]model.Asset, error) {
+	mspID, _, err := GetClient(ctx)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return nil, err
+	}
+
 	assets, err := s.repository.Assets().Filter(ctx, map[string]any{
 		"type": fmt.Sprint(reflect.TypeOf(new(model.Asset))),
 	})
@@ -145,30 +188,37 @@ func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface
 		return nil, err
 	}
 
-	return assets, nil
+	filteredAssets := make([]model.Asset, 0)
+	for _, asset := range assets {
+		if s.isSameMSP(asset.Owner, mspID) {
+			filteredAssets = append(filteredAssets, asset)
+		}
+	}
+
+	return filteredAssets, nil
 }
 
 func (s *SmartContract) QueryAssets(ctx contractapi.TransactionContextInterface, query string) ([]model.Asset, error) {
+	mspID, _, err := GetClient(ctx)
+	if err != nil {
+		log.Printf("err: %v", err.Error())
+		return nil, err
+	}
+
 	assets, err := s.repository.Assets().List(ctx, query)
 	if err != nil {
 		log.Printf("err: %v", err.Error())
 		return nil, err
 	}
 
-	result := make([]model.Asset, 0)
-	for _, i := range assets {
-		granted, err := s.isAccessGranted(ctx, &i)
-		if err != nil {
-			log.Printf("err: %v", err.Error())
-			return nil, err
-		}
-
-		if granted {
-			result = append(result, i)
+	filteredAssets := make([]model.Asset, 0)
+	for _, asset := range assets {
+		if s.isSameMSP(asset.Owner, mspID) {
+			filteredAssets = append(filteredAssets, asset)
 		}
 	}
 
-	return result, nil
+	return filteredAssets, nil
 }
 
 func (s *SmartContract) isAccessGranted(ctx contractapi.TransactionContextInterface, item *model.Asset) (bool, error) {
@@ -177,10 +227,13 @@ func (s *SmartContract) isAccessGranted(ctx contractapi.TransactionContextInterf
 		log.Printf("err: %v", err.Error())
 		return false, err
 	}
-	owner := toOwner(mspID, clientID)
-	if item.Owner != owner {
-		return false, nil
-	}
+	return s.isOwner(item.Owner, clientID, mspID), nil
+}
 
-	return true, nil
+func (s *SmartContract) isOwner(owner, clientID, mspID string) bool {
+	return owner == toOwner(clientID, mspID)
+}
+
+func (s *SmartContract) isSameMSP(owner, mspID string) bool {
+	return strings.HasSuffix(owner, "@"+mspID)
 }
